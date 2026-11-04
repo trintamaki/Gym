@@ -2,6 +2,26 @@
 
 Data links: ?
 
+## Environment Server sessions
+
+The server accepts typed `ResourcesSeedSessionRequest` bodies from `single_agent_turn`,
+alongside the existing flat seed request. A typed seed returns `SandboxAccess` for the
+task sandbox and its working directory. Resources owns that sandbox; the agent borrows
+it and must close before verification. The Environment Server closes Resources after
+verification or an interrupted episode.
+
+Identical seed retries reuse the sandbox. Conflicting seeds and seeds after close are
+rejected. Typed verification captures the patch before releasing the task sandbox, so a
+failed stop can retry without losing the patch. Identical verification retries reuse the
+completed result. Seed, verify and close serialize per session. Close retains a failed
+task or verifier teardown for retry; cleanup is shielded from request cancellation and
+bounded by `session_cleanup_timeout_seconds` (120 seconds by default).
+
+Session records are process-local and use Gym's session routing. Successful close fences
+late seeds for `session_close_retry_window_seconds`. Shutdown attempts remaining cleanup;
+configure a provider-enforced `sandbox_config.ttl_s` for abandoned sessions. This does not
+change the benchmark prompt, patch extraction rules or scoring protocol.
+
 # Quickstart
 ## Apply golden patches
 ### Start resources server

@@ -17,8 +17,8 @@
 
 Writes the dev split: 100 JavaScript tasks from five repositories, most of whose issues show the
 bug in a screenshot. The issue's images (``image_assets["problem_statement"]``) are downloaded and
-attached to the user turn as ``input_image`` data URIs after the prompt text, because the OpenCode
-sandbox has no internet access. An asset that is not a PNG, JPEG, GIF or WebP image (the formats
+attached to the user turn as ``input_image`` data URIs after the prompt text, so rollouts do not
+need to fetch issue image URLs. An asset that is not a PNG, JPEG, GIF or WebP image (the formats
 OpenCode attaches) is left out; its URL stays in the issue text.
 
 The test split is not prepared: the SWE-bench harness pinned by the swebench resources server

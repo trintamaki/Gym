@@ -14,8 +14,11 @@
 # limitations under the License.
 
 import hashlib
+import logging
 import re
 import sys
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
 from shlex import quote
@@ -24,8 +27,9 @@ from time import monotonic, time
 from traceback import format_exc
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import Request
-from pydantic import BaseModel, Field
+from anyio import fail_after
+from fastapi import FastAPI, Request
+from pydantic import BaseModel, Field, PositiveFloat, ValidationError
 from swebench.harness.run_evaluation import make_test_spec
 from swebench.harness.test_spec.test_spec import LATEST, TestSpec
 
@@ -41,6 +45,8 @@ from nemo_gym.core import (
 )
 from nemo_gym.sandbox import (
     AsyncSandbox,
+    DirectSandboxConnection,
+    SandboxAccess,
     SandboxResources,
     SandboxSpec,
     cpu_cap_env,
@@ -53,7 +59,15 @@ from nemo_gym.server_runtime import (
     BaseSeedSessionResponse,
     BaseVerifyRequest,
     BaseVerifyResponse,
+    ResourcesCloseSessionRequest,
+    ResourcesCloseSessionResponse,
+    ResourcesSeedRejectedError,
+    ResourcesSeedSessionRequest,
+    ResourcesSeedSessionResponse,
+    ResourcesSessionConflictError,
+    ResourcesSessionFence,
     SimpleResourcesServer,
+    lost_session_verification,
 )
 from nemo_gym.trajectory import SandboxObservation
 from nemo_gym.utils import bounded_text
@@ -68,6 +82,7 @@ from resources_servers.swebench.swebench_patches import (
 
 # The longest failure_reason a failure event accepts.
 _MAX_FAILURE_REASON_CHARS = 2000
+LOGGER = logging.getLogger(__name__)
 
 
 class SwebenchResourcesServerConfig(BaseResourcesServerConfig):
@@ -84,6 +99,7 @@ class SwebenchResourcesServerConfig(BaseResourcesServerConfig):
     sandbox_config: Dict[str, Any]
 
     clear_swebench_debug_logs: bool = True
+    session_cleanup_timeout_seconds: PositiveFloat = 120
 
     def model_post_init(self, context: Any, /) -> None:
         if self.is_verifying_golden_patch and self.clear_swebench_debug_logs:
@@ -289,6 +305,16 @@ def strip_binary_diffs(patch: str) -> str:
     return "".join(sec for sec in sections if not re.search(r"(?m)^Binary files .* differ$", sec))
 
 
+@dataclass
+class _TaskSession:
+    seed: ResourcesSeedSessionRequest
+    task: SWEBenchInstanceRequest
+    access: SandboxAccess | None = None
+    model_patch: str | None = None
+    verify_request: SWEBenchVerifyRequest | None = None
+    verification: SWEBenchVerifyResponse | None = None
+
+
 class SwebenchResourcesServer(SimpleResourcesServer):
     config: SwebenchResourcesServerConfig
 
@@ -297,8 +323,74 @@ class SwebenchResourcesServer(SimpleResourcesServer):
 
         self._session_id_to_sandbox: Dict[str, AsyncSandbox] = dict()
         self._session_id_to_seed_head: Dict[str, str] = dict()
+        self._task_sessions: dict[str, _TaskSession] = {}
+        self._verifier_sandboxes: dict[str, AsyncSandbox] = {}
+        self._fence = ResourcesSessionFence(self.config.session_close_retry_window_seconds)
 
-    async def _create_sandbox(self, test_spec: TestSpec) -> AsyncSandbox:
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        parent_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            try:
+                async with parent_lifespan(app) as state:
+                    yield state
+            finally:
+                await self.shutdown()
+
+        app.router.lifespan_context = lifespan
+        return app
+
+    async def _stop_sandbox(self, sandboxes: dict[str, AsyncSandbox], session_id: str) -> None:
+        sandbox = sandboxes.get(session_id)
+        if sandbox is not None:
+            # A disconnect can cancel the request's AnyIO scope. Keep the owner handle until stop succeeds.
+            with fail_after(self.config.session_cleanup_timeout_seconds, shield=True):
+                await sandbox.stop()
+            sandboxes.pop(session_id)
+
+    async def _release_session(self, session_id: str) -> None:
+        await self._stop_sandbox(self._session_id_to_sandbox, session_id)
+        self._session_id_to_seed_head.pop(session_id, None)
+        await self._stop_sandbox(self._verifier_sandboxes, session_id)
+
+    async def close_resources_session(
+        self, request: Request, body: ResourcesCloseSessionRequest
+    ) -> ResourcesCloseSessionResponse:
+        """Release the caller-assigned session, retaining failed teardown for a close retry."""
+        session_id = body.resources_session_id
+        async with self._fence.locked(session_id):
+            closed = self._fence.closed_episode(session_id)
+            state = self._task_sessions.get(session_id)
+            expected_episode = closed if closed is not None else state.seed.episode_id if state is not None else None
+            if expected_episode is not None and expected_episode != body.episode_id:
+                raise ResourcesSessionConflictError("episode_id does not match the resources session")
+            await self._release_session(session_id)
+            self._task_sessions.pop(session_id, None)
+            self._fence.mark_closed(session_id, body.episode_id)
+            if request.session.get(SESSION_ID_KEY) == session_id:
+                request.session.pop(SESSION_ID_KEY, None)
+            return ResourcesCloseSessionResponse(resources_session_id=session_id)
+
+    async def shutdown(self) -> None:
+        """Release task and verifier sandboxes left by interrupted episodes."""
+        session_ids = self._task_sessions.keys() | self._session_id_to_sandbox.keys() | self._verifier_sandboxes.keys()
+        for session_id in session_ids:
+            async with self._fence.locked(session_id):
+                try:
+                    await self._release_session(session_id)
+                    self._task_sessions.pop(session_id, None)
+                except Exception:
+                    LOGGER.exception("Failed to stop abandoned SWE-bench session %s", session_id)
+
+    async def _create_sandbox(
+        self,
+        test_spec: TestSpec,
+        *,
+        task_session_id: str | None = None,
+        verifier_session_id: str | None = None,
+    ) -> AsyncSandbox:
         # TODO @bxyu-nvidia: Refactor this after Hemil's swap from Python dataclass to Pydantic BaseModel
         global_config_dict = get_global_config_dict()
         resolved_sandbox_provider = resolve_provider_config(self.config.sandbox_provider, global_config_dict)
@@ -332,6 +424,11 @@ class SwebenchResourcesServer(SimpleResourcesServer):
             provider_options=self.config.sandbox_config.get("provider_options", {}),
         )
         eval_sandbox = AsyncSandbox(resolved_sandbox_provider)
+        # Retain ownership even if start_with_setup raises after its cleanup attempt also failed.
+        if task_session_id is not None:
+            self._session_id_to_sandbox[task_session_id] = eval_sandbox
+        if verifier_session_id is not None:
+            self._verifier_sandboxes[verifier_session_id] = eval_sandbox
 
         async def _run_setup(sandbox: AsyncSandbox) -> None:
             await patch_swebench_multilingual_sandbox(
@@ -345,7 +442,7 @@ class SwebenchResourcesServer(SimpleResourcesServer):
 
         return eval_sandbox
 
-    def _make_test_spec(self, body: SWEBenchVerifyRequest) -> TestSpec:
+    def _make_test_spec(self, body: SWEBenchInstanceRequest) -> TestSpec:
         return make_test_spec(
             # This accepts a SWEbenchInstance which is identically our body.
             body.model_dump(),
@@ -354,14 +451,75 @@ class SwebenchResourcesServer(SimpleResourcesServer):
             env_image_tag=LATEST,
         )
 
-    async def seed_session(self, request: Request, body: SWEBenchSeedSessionRequest) -> SWEBenchSeedSessionResponse:
+    async def seed_session(
+        self, request: Request, body: SWEBenchSeedSessionRequest | ResourcesSeedSessionRequest
+    ) -> SWEBenchSeedSessionResponse | ResourcesSeedSessionResponse:
+        """Prepare a task sandbox for either a flat caller or an Environment Server episode."""
+        if not isinstance(body, ResourcesSeedSessionRequest):
+            session_id = request.session[SESSION_ID_KEY]
+            await self._seed_task_sandbox(session_id, body)
+            return SWEBenchSeedSessionResponse(
+                sandbox_handle=self._session_id_to_sandbox[session_id]._handle.sandbox_id
+            )
+
+        session_id = body.resources_session_id
+        async with self._fence.locked(session_id):
+            self._fence.raise_if_closed(session_id)
+            state = self._task_sessions.get(session_id)
+            if state is not None:
+                if state.seed != body:
+                    raise ResourcesSessionConflictError("resources_session_id is already bound to another seed")
+                if state.verify_request is not None:
+                    raise ResourcesSessionConflictError("The task sandbox has already entered verification")
+            else:
+                try:
+                    task = SWEBenchInstanceRequest.model_validate(body.task_data)
+                except ValidationError as error:
+                    raise ResourcesSeedRejectedError(f"task_data is not a SWE-bench instance: {error}") from error
+                # TaskId belongs to the caller's task envelope, not to a field inside its task_data.
+                state = _TaskSession(seed=body.model_copy(deep=True), task=task)
+                self._task_sessions[session_id] = state
+            if state.access is None:
+                try:
+                    # Retry cleanup before retrying a seed whose setup or handoff failed.
+                    await self._release_session(session_id)
+                    workdir = await self._seed_task_sandbox(session_id, state.task, require_workdir=True)
+                    state.access = SandboxAccess(
+                        connection=DirectSandboxConnection(
+                            provider_config_ref=self.config.sandbox_provider,
+                            descriptor=await self._session_id_to_sandbox[session_id].serialize(scope="operate"),
+                        ),
+                        workdir=workdir,
+                    )
+                except BaseException:
+                    try:
+                        await self._release_session(session_id)
+                        self._task_sessions.pop(session_id, None)
+                    except Exception:
+                        LOGGER.exception("Failed to clean up SWE-bench seed %s; close can retry", session_id)
+                    raise
+            # A refused seed must not replace the caller's cookie with another episode's session.
+            request.session[SESSION_ID_KEY] = session_id
+            return ResourcesSeedSessionResponse(resources_session_id=session_id, sandbox_access=state.access)
+
+    async def _seed_task_sandbox(
+        self, session_id: str, body: SWEBenchInstanceRequest, *, require_workdir: bool = False
+    ) -> str:
         test_spec = self._make_test_spec(body)
-        eval_sandbox = await self._create_sandbox(test_spec)
-        self._session_id_to_sandbox[request.session[SESSION_ID_KEY]] = eval_sandbox
+        eval_sandbox = await self._create_sandbox(test_spec, task_session_id=session_id if require_workdir else None)
+        self._session_id_to_sandbox[session_id] = eval_sandbox
+
+        wd = ""
+        if require_workdir or self.config.apply_anti_cheating:
+            result = await eval_sandbox.exec("pwd")
+            wd = (result.stdout or "").strip()
+            if require_workdir and (
+                result.error_type is not None or result.return_code != 0 or not wd.startswith("/")
+            ):
+                raise RuntimeError("SWE-bench task sandbox did not report an absolute working directory")
 
         if self.config.apply_anti_cheating:
             # Remove the current Git repo's future history beyond the current commit to prevent the model from cheating.
-            wd = (await eval_sandbox.exec("pwd")).stdout.strip()
             anti_cheat_setup_fpath = Path(__file__).parent / "anti_cheat_setup.sh"
             await eval_sandbox.upload(anti_cheat_setup_fpath, f"{wd}/anti_cheat_setup.sh")
             result = await eval_sandbox.exec(
@@ -379,11 +537,55 @@ Stderr:
         # the task's base commit if git is unavailable.
         head_result = await eval_sandbox.exec("git rev-parse HEAD")
         seed_head = (head_result.stdout or "").strip() if head_result.return_code == 0 else ""
-        self._session_id_to_seed_head[request.session[SESSION_ID_KEY]] = seed_head or test_spec.base_commit
-
-        return SWEBenchSeedSessionResponse(sandbox_handle=eval_sandbox._handle.sandbox_id)
+        self._session_id_to_seed_head[session_id] = seed_head or test_spec.base_commit
+        return wd
 
     async def verify(self, request: Request, body: SWEBenchVerifyRequest) -> SWEBenchVerifyResponse:
+        """Grade the task sandbox after agent close; typed retries reuse the captured patch or verdict."""
+        session_id = request.session[SESSION_ID_KEY]
+        async with self._fence.locked(session_id):
+            if self._fence.closed_episode(session_id) is not None:
+                return _lost_session_response(body, "The SWE-bench resources session is closed")
+            state = self._task_sessions.get(session_id)
+            if state is None:
+                if not self.config.is_verifying_golden_patch and session_id not in self._session_id_to_sandbox:
+                    return _lost_session_response(body, "The SWE-bench task sandbox is missing or was never seeded")
+                return await self._verify(request, body)
+            if state.access is None:
+                return _lost_session_response(body, "The SWE-bench task session did not finish seeding")
+            if SWEBenchInstanceRequest.model_validate(body.model_dump()) != state.task:
+                raise ResourcesSessionConflictError("Verification task does not match the seeded task")
+            if state.verify_request is not None and body != state.verify_request:
+                raise ResourcesSessionConflictError("Verification input does not match the first request")
+            state.verify_request = body.model_copy(deep=True)
+            if state.verification is not None:
+                return state.verification
+            if state.model_patch is None:
+                if self.config.is_verifying_golden_patch:
+                    state.model_patch = body.patch
+                else:
+                    sandbox = self._session_id_to_sandbox.get(session_id)
+                    if sandbox is None:
+                        return _lost_session_response(body, "The SWE-bench task sandbox is missing")
+                    seed_head = self._session_id_to_seed_head[session_id]
+                    result = await sandbox.exec(patch_extraction_command(state.access.workdir, seed_head))
+                    if result.error_type is not None or result.return_code != 0:
+                        raise RuntimeError("Failed to extract the SWE-bench model patch from the task sandbox")
+                    state.model_patch = strip_binary_diffs(result.stdout or "")
+            # Keep the patch and task handle if stop fails; a retry must never capture an empty replacement patch.
+            await self._release_session(session_id)
+            try:
+                state.verification = await self._verify(request, body, captured_patch=state.model_patch)
+            finally:
+                try:
+                    await self._stop_sandbox(self._verifier_sandboxes, session_id)
+                except Exception:
+                    LOGGER.exception("Failed to stop SWE-bench verifier %s; close can retry", session_id)
+            return state.verification
+
+    async def _verify(
+        self, request: Request, body: SWEBenchVerifyRequest, *, captured_patch: str | None = None
+    ) -> SWEBenchVerifyResponse:
         """
         Key requirements:
         1. Extract the model_patch from the input container
@@ -408,12 +610,18 @@ Stderr:
         test_spec = self._make_test_spec(body)
 
         verifier_sandbox_lifecycle_started_at = monotonic()
-        eval_sandbox = await self._create_sandbox(test_spec)
+        eval_sandbox = await self._create_sandbox(
+            test_spec, verifier_session_id=request.session[SESSION_ID_KEY] if captured_patch is not None else None
+        )
+        if captured_patch is not None:
+            self._verifier_sandboxes[request.session[SESSION_ID_KEY]] = eval_sandbox
         eval_sandbox_start_time_taken = monotonic() - verifier_sandbox_lifecycle_started_at
 
         model_patch = ""
         patch_extraction_failed = False
-        if self.config.is_verifying_golden_patch:
+        if captured_patch is not None:
+            model_patch = captured_patch
+        elif self.config.is_verifying_golden_patch:
             model_patch = body.patch
         else:
             original_sandbox = self._session_id_to_sandbox.pop(request.session[SESSION_ID_KEY])
@@ -523,6 +731,25 @@ Stderr:
             log_dir=str(log_dir),
             verifier_sandbox_observation=verifier_sandbox_observation,
         )
+
+
+def _lost_session_response(body: SWEBenchVerifyRequest, reason: str) -> SWEBenchVerifyResponse:
+    """Return an unscored, masked result when the task state is unavailable."""
+    return SWEBenchVerifyResponse.model_validate(
+        body.model_dump()
+        | lost_session_verification(reason)
+        | {
+            "evaluation_completed": False,
+            "resolved": False,
+            "eval_sandbox_start_time_taken": 0.0,
+            "patch_verification_time_taken": 0.0,
+            "instance_id": body.instance_id,
+            "model_patch": None,
+            "model_patch_sha256": None,
+            "test_output": "",
+            "log_dir": "",
+        }
+    )
 
 
 if __name__ == "__main__":
