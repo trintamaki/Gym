@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
-from nemo_gym.core import EpisodeId, TaskId
+from nemo_gym.core import SESSION_LOST, EpisodeId, TaskId
 from nemo_gym.sandbox import SandboxExecResult, SandboxHandle
 from nemo_gym.server_runtime import (
     ResourcesCloseSessionRequest,
@@ -150,6 +150,56 @@ def test_invalid_task_is_rejected_before_creating_sandbox(session_server):
     server._create_sandbox.assert_not_awaited()
 
 
+@pytest.mark.parametrize("session_state", ["never_seeded", "closed", "lost"])
+def test_http_verify_masks_unavailable_session_without_creating_sandbox(session_server, session_state):
+    server, _, _, grader = session_server
+    with TestClient(server.setup_webserver()) as client:
+        if session_state != "never_seeded":
+            assert client.post("/seed_session", json=_seed().model_dump(mode="json")).status_code == 200
+            if session_state == "closed":
+                cookies = dict(client.cookies)
+                assert client.post("/close_session", json=_close().model_dump(mode="json")).status_code == 200
+                # Reuse the original cookie to exercise the retained closed-session fence.
+                client.cookies.clear()
+                client.cookies.update(cookies)
+            else:
+                server._session_id_to_sandbox.pop("session")
+        server._create_sandbox.reset_mock()
+        server._make_test_spec.reset_mock()
+        response = client.post("/verify", json=VERIFY_BODY)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["mask_sample"] is True
+        assert result["failure_kind"] == SESSION_LOST
+        assert result["reward"] == 0.0
+        assert result["evaluation_completed"] is False
+        assert result["resolved"] is False
+        assert result["model_patch"] is None
+        assert result["model_patch_sha256"] is None
+        assert result["eval_sandbox_start_time_taken"] == 0.0
+        if session_state == "closed":
+            assert "closed" in result["failure_reason"]
+        server._make_test_spec.assert_not_called()
+        server._create_sandbox.assert_not_awaited()
+        grader.assert_not_awaited()
+
+
+def test_http_golden_patch_verify_does_not_require_seed(session_server):
+    server, _, _, grader = session_server
+    server.config.is_verifying_golden_patch = True
+    with TestClient(server.setup_webserver()) as client:
+        response = client.post("/verify", json=VERIFY_BODY)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["evaluation_completed"] is True
+        assert result["reward"] == 1
+        assert result["mask_sample"] is False
+        assert result["model_patch"] == VERIFY_BODY["patch"]
+        assert grader.await_args.kwargs["pred"]["model_patch"] == VERIFY_BODY["patch"]
+        grader.assert_awaited_once()
+        server._create_sandbox.assert_awaited_once()
+
+
 async def test_unknown_close_fences_late_seed_and_rejects_another_episode(session_server):
     server, _, _, _ = session_server
     await server.close_resources_session(_request(), _close())
@@ -280,6 +330,7 @@ async def test_verification_retry_reuses_patch_after_task_stop_failure(session_s
     assert result.reward == 1 and result.model_patch == PATCH
     assert grader.await_args.kwargs["pred"]["model_patch"] == PATCH
     assert task.exec.await_count == extraction_calls
+    assert "session" not in server._session_id_to_sandbox
     assert await server.verify(_request(), body) == result
     grader.assert_awaited_once()
     verifier.stop.assert_awaited_once()

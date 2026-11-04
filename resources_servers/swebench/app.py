@@ -67,6 +67,7 @@ from nemo_gym.server_runtime import (
     ResourcesSessionConflictError,
     ResourcesSessionFence,
     SimpleResourcesServer,
+    lost_session_verification,
 )
 from nemo_gym.trajectory import SandboxObservation
 from nemo_gym.utils import bounded_text
@@ -543,12 +544,15 @@ Stderr:
         """Grade the task sandbox after agent close; typed retries reuse the captured patch or verdict."""
         session_id = request.session[SESSION_ID_KEY]
         async with self._fence.locked(session_id):
-            self._fence.raise_if_closed(session_id)
+            if self._fence.closed_episode(session_id) is not None:
+                return _lost_session_response(body, "The SWE-bench resources session is closed")
             state = self._task_sessions.get(session_id)
             if state is None:
+                if not self.config.is_verifying_golden_patch and session_id not in self._session_id_to_sandbox:
+                    return _lost_session_response(body, "The SWE-bench task sandbox is missing or was never seeded")
                 return await self._verify(request, body)
             if state.access is None:
-                raise ResourcesSessionConflictError("The task session has not finished seeding")
+                return _lost_session_response(body, "The SWE-bench task session did not finish seeding")
             if SWEBenchInstanceRequest.model_validate(body.model_dump()) != state.task:
                 raise ResourcesSessionConflictError("Verification task does not match the seeded task")
             if state.verify_request is not None and body != state.verify_request:
@@ -560,7 +564,9 @@ Stderr:
                 if self.config.is_verifying_golden_patch:
                     state.model_patch = body.patch
                 else:
-                    sandbox = self._session_id_to_sandbox[session_id]
+                    sandbox = self._session_id_to_sandbox.get(session_id)
+                    if sandbox is None:
+                        return _lost_session_response(body, "The SWE-bench task sandbox is missing")
                     seed_head = self._session_id_to_seed_head[session_id]
                     result = await sandbox.exec(patch_extraction_command(state.access.workdir, seed_head))
                     if result.error_type is not None or result.return_code != 0:
@@ -725,6 +731,25 @@ Stderr:
             log_dir=str(log_dir),
             verifier_sandbox_observation=verifier_sandbox_observation,
         )
+
+
+def _lost_session_response(body: SWEBenchVerifyRequest, reason: str) -> SWEBenchVerifyResponse:
+    """Return an unscored, masked result when the task state is unavailable."""
+    return SWEBenchVerifyResponse.model_validate(
+        body.model_dump()
+        | lost_session_verification(reason)
+        | {
+            "evaluation_completed": False,
+            "resolved": False,
+            "eval_sandbox_start_time_taken": 0.0,
+            "patch_verification_time_taken": 0.0,
+            "instance_id": body.instance_id,
+            "model_patch": None,
+            "model_patch_sha256": None,
+            "test_output": "",
+            "log_dir": "",
+        }
+    )
 
 
 if __name__ == "__main__":
