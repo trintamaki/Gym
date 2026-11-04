@@ -7,7 +7,12 @@ Adds multiple SWE benchmarks to Gym. These are useable across agents/harnesses.
 - Data source: `princeton-nlp/SWE-bench_Verified`
 - SWE Bench Multimodal (`benchmarks/swebench/multimodal/opencode.yaml`): the dev split of
   `SWE-bench/SWE-bench_Multimodal`, 100 JavaScript tasks. The prepare script downloads each
-  issue's images and attaches them to the prompt, so it needs internet access; rollouts do not.
+  issue's images and attaches them to the prompt, so rollouts do not need to fetch issue image URLs.
+  This recipe routes `swebench:multimodal` through `single_agent_turn` to `opencode_agent`.
+  SWE-bench resources own the task sandbox; OpenCode borrows it through a session and stages
+  image attachments outside the repository. Use a model that supports images and tool calls.
+  The agent instance is now `swebench_multimodal_opencode_agent`; training token-ID capture
+  follows the new agent's opt-in setting. Rebaseline scores when changing harnesses.
   The test split is not prepared, because the pinned SWE-bench harness (swebench 4.1.0) has no
   environment specs for its repositories.
 
