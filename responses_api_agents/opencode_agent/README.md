@@ -17,12 +17,11 @@ and apply to local calls too. Subagents (`task`) are intentionally enabled for t
 general-purpose integration; the separate `opencode_sandboxed_agent` benchmark
 profile still disables them. Use explicit tool overrides when comparing scores.
 
-Existing flat-row benchmarks keep the `opencode_sandboxed_agent` entrypoint
-and configuration for their Resources-owned lifecycle.
-
-The old `opencode_sandboxed_agent` package remains separate; only its shell PATH
-quoting is fixed for directories containing spaces. No benchmark recipes or
-Resources allowlists are migrated by this integration.
+SWE-bench Multimodal uses this agent through the `swebench:multimodal` taskset and
+`single_agent_turn`; its Resources server owns the sandbox. See
+[`benchmarks/swebench/multimodal/opencode.yaml`](../../benchmarks/swebench/multimodal/opencode.yaml).
+Other existing flat-row benchmark recipes keep their separate `opencode_sandboxed_agent`
+entrypoint and configuration.
 
 ## EnvironmentServer sessions
 
@@ -115,9 +114,19 @@ its private HOME. The adapter requires a fresh successful-initialization receipt
 the task environment hook before accepting a gradable result. A missing or invalid
 receipt fails the activation even if the CLI ignored a plugin-loading error.
 
-The session path accepts one text task, optional system/developer text and
-`instructions`. Unsupported controls, images, history replay and required direct-HTTP
-tool grants are rejected. MCP tool grants become OpenCode `remote` MCP servers, and the model sees
+The session path accepts one user task containing text and optional `input_image` parts,
+optional system/developer text, and `instructions`. Images must be base64 data URIs with
+PNG, JPEG, GIF or WebP media types and matching image signatures. Remote image URLs,
+`file_id` references and images in system/developer messages are rejected before activation.
+The adapter uploads the original image bytes in input order to its session directory,
+outside the task workdir, and attaches those files with OpenCode's `-f` option. Continuations
+use separate activation directories; close removes the session's attachments. Image requests
+enable the model's image input modality and attachment limits that prevent OpenCode from
+resizing or re-encoding the supplied images. This capability stays enabled for later text-only
+activations that replay earlier images. The configured Gym model must support image input.
+
+Unsupported controls, history replay and required direct-HTTP tool grants are rejected.
+MCP tool grants become OpenCode `remote` MCP servers, and the model sees
 their tools as `<grant>_<tool>`. `mcp_tool_timeout_seconds` sets their connection and per-call
 timeout; without it, OpenCode allows 30 seconds to connect and 60 seconds per call. A call still
 fails after about 300 seconds, Bun's default `fetch` timeout. Before the first model call,
